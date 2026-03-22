@@ -1,0 +1,185 @@
+#!/bin/bash
+# meet — record meetings and transcribe them locally
+# Usage: meet start [name]  — start recording
+#        meet stop           — stop recording + transcribe
+#        meet list           — list recordings
+#        meet transcribe <file>  — transcribe an existing audio file
+
+set -e
+
+MEET_DIR="${MEET_DIR:-$HOME/src/hub/meetings/recordings}"
+TRANSCRIPT_DIR="${MEET_DIR}/transcripts"
+PID_FILE="/tmp/meet-recording.pid"
+META_FILE="/tmp/meet-recording.meta"
+
+mkdir -p "$MEET_DIR" "$TRANSCRIPT_DIR"
+
+# Colors
+GREEN='\033[0;32m'
+RED='\033[0;31m'
+YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
+NC='\033[0m'
+
+case "${1:-help}" in
+
+  start)
+    if [ -f "$PID_FILE" ]; then
+      echo -e "${RED}Already recording.${NC} Run 'meet stop' first."
+      exit 1
+    fi
+
+    NAME="${2:-meeting}"
+    TIMESTAMP=$(date +%Y-%m-%d-%H%M)
+    FILENAME="${TIMESTAMP}-${NAME}.wav"
+    FILEPATH="${MEET_DIR}/${FILENAME}"
+
+    echo -e "${GREEN}Recording:${NC} ${FILENAME}"
+    echo -e "${YELLOW}Tip:${NC} Make sure your mic is picking up both sides of the call."
+    echo -e "     For Google Meet / Zoom, use headphones so your mic catches the speaker output."
+    echo ""
+    echo -e "${BLUE}Press Ctrl+C or run 'meet stop' in another terminal to finish.${NC}"
+
+    # Save metadata
+    echo "$FILEPATH" > "$META_FILE"
+    echo "$FILENAME" >> "$META_FILE"
+
+    # Record in background using sox (coreaudio on macOS)
+    sox -d -r 16000 -c 1 -b 16 "$FILEPATH" &
+    echo $! > "$PID_FILE"
+
+    # Wait for the recording process
+    wait $! 2>/dev/null || true
+
+    # If we get here via Ctrl+C, clean up
+    if [ -f "$PID_FILE" ]; then
+      rm -f "$PID_FILE"
+      echo ""
+      echo -e "${GREEN}Recording saved:${NC} ${FILEPATH}"
+      echo -e "Run ${BLUE}meet transcribe ${FILEPATH}${NC} to get the transcript."
+      echo -e "Or run ${BLUE}meet stop${NC} for auto-transcription (if started in background)."
+    fi
+    ;;
+
+  stop)
+    if [ ! -f "$PID_FILE" ]; then
+      echo -e "${RED}No active recording.${NC} Run 'meet start' first."
+      exit 1
+    fi
+
+    PID=$(cat "$PID_FILE")
+    FILEPATH=$(head -1 "$META_FILE")
+    FILENAME=$(tail -1 "$META_FILE")
+
+    # Stop recording
+    kill "$PID" 2>/dev/null || true
+    sleep 1
+    rm -f "$PID_FILE" "$META_FILE"
+
+    echo -e "${GREEN}Recording stopped:${NC} ${FILEPATH}"
+
+    # Check file exists and has content
+    if [ ! -f "$FILEPATH" ] || [ ! -s "$FILEPATH" ]; then
+      echo -e "${RED}Recording file is empty or missing.${NC}"
+      exit 1
+    fi
+
+    DURATION=$(sox "$FILEPATH" -n stat 2>&1 | grep "Length" | awk '{print $3}' | cut -d. -f1)
+    echo -e "${BLUE}Duration:${NC} ${DURATION}s"
+    echo ""
+
+    # Auto-transcribe
+    echo -e "${YELLOW}Transcribing...${NC} (this takes roughly 1 min per 10 min of audio)"
+    BASENAME=$(basename "$FILEPATH" .wav)
+    mlx_whisper "$FILEPATH" \
+      --model mlx-community/whisper-large-v3-turbo \
+      --language en \
+      --output-dir "$TRANSCRIPT_DIR" \
+      --output-format txt 2>&1 | tail -3
+
+    TRANSCRIPT="${TRANSCRIPT_DIR}/${BASENAME}.txt"
+    if [ -f "$TRANSCRIPT" ]; then
+      WORDS=$(wc -w < "$TRANSCRIPT")
+      echo ""
+      echo -e "${GREEN}Transcript saved:${NC} ${TRANSCRIPT}"
+      echo -e "${BLUE}Words:${NC} ${WORDS}"
+      echo ""
+      echo -e "Preview:"
+      head -10 "$TRANSCRIPT"
+      echo "..."
+    else
+      echo -e "${RED}Transcription failed.${NC}"
+    fi
+    ;;
+
+  transcribe)
+    if [ -z "$2" ]; then
+      echo "Usage: meet transcribe <audio-file>"
+      exit 1
+    fi
+
+    INPUT="$2"
+    if [ ! -f "$INPUT" ]; then
+      echo -e "${RED}File not found:${NC} ${INPUT}"
+      exit 1
+    fi
+
+    echo -e "${YELLOW}Transcribing:${NC} ${INPUT}"
+
+    # Convert to wav if needed
+    EXT="${INPUT##*.}"
+    if [ "$EXT" != "wav" ]; then
+      TMPWAV="/tmp/meet-convert-$$.wav"
+      echo -e "${BLUE}Converting ${EXT} to wav...${NC}"
+      ffmpeg -i "$INPUT" -ar 16000 -ac 1 -c:a pcm_s16le "$TMPWAV" -y 2>/dev/null
+      INPUT="$TMPWAV"
+    fi
+
+    BASENAME=$(basename "$2" | sed 's/\.[^.]*$//')
+    mlx_whisper "$INPUT" \
+      --model mlx-community/whisper-large-v3-turbo \
+      --language en \
+      --output-dir "$TRANSCRIPT_DIR" \
+      --output-format txt 2>&1 | tail -3
+
+    # Clean up temp file
+    [ -n "$TMPWAV" ] && rm -f "$TMPWAV"
+
+    TRANSCRIPT="${TRANSCRIPT_DIR}/${BASENAME}.txt"
+    if [ -f "$TRANSCRIPT" ]; then
+      WORDS=$(wc -w < "$TRANSCRIPT")
+      echo ""
+      echo -e "${GREEN}Transcript saved:${NC} ${TRANSCRIPT}"
+      echo -e "${BLUE}Words:${NC} ${WORDS}"
+    fi
+    ;;
+
+  list)
+    echo -e "${BLUE}Recordings:${NC}"
+    ls -lh "$MEET_DIR"/*.wav 2>/dev/null || echo "  No recordings yet."
+    echo ""
+    echo -e "${BLUE}Transcripts:${NC}"
+    ls -lh "$TRANSCRIPT_DIR"/*.txt 2>/dev/null || echo "  No transcripts yet."
+    ;;
+
+  help|*)
+    echo ""
+    echo "  meet — record meetings and transcribe them locally"
+    echo ""
+    echo "  Commands:"
+    echo "    meet start [name]        Start recording (default name: meeting)"
+    echo "    meet stop                Stop recording + auto-transcribe"
+    echo "    meet transcribe <file>   Transcribe an existing audio/video file"
+    echo "    meet list                List recordings and transcripts"
+    echo ""
+    echo "  Examples:"
+    echo "    meet start mike-session-3"
+    echo "    meet stop"
+    echo "    meet transcribe ~/Downloads/call-recording.m4a"
+    echo ""
+    echo "  Recordings: ${MEET_DIR}"
+    echo "  Transcripts: ${TRANSCRIPT_DIR}"
+    echo ""
+    ;;
+
+esac
