@@ -12,6 +12,14 @@ TRANSCRIPT_DIR="${MEET_DIR}/transcripts"
 PID_FILE="/tmp/meet-recording.pid"
 META_FILE="/tmp/meet-recording.meta"
 
+# Audio device: use "Meet Recording" aggregate device if available, otherwise default mic
+AUDIO_DEVICE="${MEET_DEVICE:-}"
+if [ -z "$AUDIO_DEVICE" ]; then
+  if system_profiler SPAudioDataType 2>/dev/null | grep -q "Meet Recording"; then
+    AUDIO_DEVICE="Meet Recording"
+  fi
+fi
+
 mkdir -p "$MEET_DIR" "$TRANSCRIPT_DIR"
 
 # Colors
@@ -35,8 +43,20 @@ case "${1:-help}" in
     FILEPATH="${MEET_DIR}/${FILENAME}"
 
     echo -e "${GREEN}Recording:${NC} ${FILENAME}"
-    echo -e "${YELLOW}Tip:${NC} Make sure your mic is picking up both sides of the call."
-    echo -e "     For Google Meet / Zoom, use headphones so your mic catches the speaker output."
+
+    # Auto-switch output to Meet Output so BlackHole captures call audio
+    if command -v SwitchAudioSource &>/dev/null && [ -n "$AUDIO_DEVICE" ]; then
+      PREV_OUTPUT=$(SwitchAudioSource -c -t output 2>/dev/null)
+      echo "$PREV_OUTPUT" > /tmp/meet-prev-output
+      if SwitchAudioSource -a -t output 2>/dev/null | grep -q "Meet Output"; then
+        SwitchAudioSource -s "Meet Output" -t output &>/dev/null
+        echo -e "${BLUE}Audio output:${NC} switched to Meet Output (auto)"
+      fi
+      echo -e "${BLUE}Audio input:${NC} ${AUDIO_DEVICE} (mic + system audio)"
+    else
+      echo -e "${YELLOW}Tip:${NC} No aggregate device found. Recording from default mic only."
+      echo -e "     Set up 'Meet Recording' in Audio MIDI Setup for full call capture."
+    fi
     echo ""
     echo -e "${BLUE}Press Ctrl+C or run 'meet stop' in another terminal to finish.${NC}"
 
@@ -44,8 +64,12 @@ case "${1:-help}" in
     echo "$FILEPATH" > "$META_FILE"
     echo "$FILENAME" >> "$META_FILE"
 
-    # Record in background using sox (coreaudio on macOS)
-    sox -d -r 16000 -c 1 -b 16 "$FILEPATH" &
+    # Record using sox (coreaudio on macOS)
+    if [ -n "$AUDIO_DEVICE" ]; then
+      sox -t coreaudio "$AUDIO_DEVICE" -r 16000 -c 1 -b 16 "$FILEPATH" &
+    else
+      sox -d -r 16000 -c 1 -b 16 "$FILEPATH" &
+    fi
     echo $! > "$PID_FILE"
 
     # Wait for the recording process
@@ -54,6 +78,12 @@ case "${1:-help}" in
     # If we get here via Ctrl+C, clean up
     if [ -f "$PID_FILE" ]; then
       rm -f "$PID_FILE"
+      # Restore audio output
+      if command -v SwitchAudioSource &>/dev/null && [ -f /tmp/meet-prev-output ]; then
+        PREV_OUTPUT=$(cat /tmp/meet-prev-output)
+        SwitchAudioSource -s "$PREV_OUTPUT" -t output &>/dev/null
+        rm -f /tmp/meet-prev-output
+      fi
       echo ""
       echo -e "${GREEN}Recording saved:${NC} ${FILEPATH}"
       echo -e "Run ${BLUE}meet transcribe ${FILEPATH}${NC} to get the transcript."
@@ -75,6 +105,14 @@ case "${1:-help}" in
     kill "$PID" 2>/dev/null || true
     sleep 1
     rm -f "$PID_FILE" "$META_FILE"
+
+    # Restore previous audio output
+    if command -v SwitchAudioSource &>/dev/null && [ -f /tmp/meet-prev-output ]; then
+      PREV_OUTPUT=$(cat /tmp/meet-prev-output)
+      SwitchAudioSource -s "$PREV_OUTPUT" -t output &>/dev/null
+      rm -f /tmp/meet-prev-output
+      echo -e "${BLUE}Audio output:${NC} restored to ${PREV_OUTPUT}"
+    fi
 
     echo -e "${GREEN}Recording stopped:${NC} ${FILEPATH}"
 
@@ -162,6 +200,18 @@ case "${1:-help}" in
     ls -lh "$TRANSCRIPT_DIR"/*.txt 2>/dev/null || echo "  No transcripts yet."
     ;;
 
+  devices)
+    echo -e "${BLUE}Audio devices:${NC}"
+    system_profiler SPAudioDataType 2>/dev/null | grep -E "^\s{8}\S" | sed 's/^        /  /'
+    echo ""
+    if [ -n "$AUDIO_DEVICE" ]; then
+      echo -e "${GREEN}Meet will record from:${NC} ${AUDIO_DEVICE}"
+    else
+      echo -e "${YELLOW}Meet will record from:${NC} default microphone"
+      echo -e "  Set up 'Meet Recording' aggregate device for full call capture."
+    fi
+    ;;
+
   help|*)
     echo ""
     echo "  meet — record meetings and transcribe them locally"
@@ -171,11 +221,16 @@ case "${1:-help}" in
     echo "    meet stop                Stop recording + auto-transcribe"
     echo "    meet transcribe <file>   Transcribe an existing audio/video file"
     echo "    meet list                List recordings and transcripts"
+    echo "    meet devices             Show audio devices and recording source"
     echo ""
     echo "  Examples:"
     echo "    meet start mike-session-3"
     echo "    meet stop"
     echo "    meet transcribe ~/Downloads/call-recording.m4a"
+    echo ""
+    echo "  Environment:"
+    echo "    MEET_DIR      Override recording directory (default: ~/src/hub/meetings/recordings)"
+    echo "    MEET_DEVICE   Override audio device (default: auto-detect Meet Recording)"
     echo ""
     echo "  Recordings: ${MEET_DIR}"
     echo "  Transcripts: ${TRANSCRIPT_DIR}"
